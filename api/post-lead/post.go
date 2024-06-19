@@ -9,17 +9,20 @@ import (
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
 	"github.com/go-playground/validator/v10"
-	"github.com/google/uuid"
 	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/sheets/v4"
 )
 
 var validate *validator.Validate
 var driveService *drive.Service
+var sheetsService *sheets.Service
 
 const MAX_REQUEST_SIZE = 20 << 20 // 20 MB
 const MAX_UPLOAD_SIZE = 15 << 20  // 15 MB
 
 func init() {
+	createGoogleSheetsService(context.TODO())
+
 	validate = validator.New(validator.WithRequiredStructEnabled())
 
 	functions.HTTP("Handler", Handler)
@@ -42,7 +45,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	defer r.MultipartForm.RemoveAll()
 
 	var body struct {
-		uuid      string
 		Email     string `json:"email" validate:"required,email"`
 		Mobile    string `json:"mobile" validate:"e164"`
 		FirstName string `json:"firstName" validate:"required"`
@@ -50,7 +52,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		Enquiry   string `json:"enquiry" validate:"required"`
 	}
 
-	body.uuid = uuid.NewString()
 	body.Email = r.FormValue("email")
 	body.Mobile = r.FormValue("mobile")
 	body.FirstName = r.FormValue("firstName")
@@ -121,7 +122,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				Create(&drive.File{
 					Name: fileHeader.Filename,
 					Properties: map[string]string{
-						"lead":      body.uuid,
 						"email":     body.Email,
 						"firstName": body.FirstName,
 						"lastName":  body.LastName,
@@ -163,10 +163,50 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	slog.Info("processed", "enquiry", fmt.Sprintf("%+v", body))
+	enquiriesSheetName := ""     // ENV
+	enquiriesSpreadsheetId := "" // ENV
+	res, err := sheetsService.Spreadsheets.Values.
+		Append(enquiriesSpreadsheetId, enquiriesSheetName, &sheets.ValueRange{
+			Values: [][]interface{}{
+				{
+					body.FirstName, body.LastName,
+					body.Enquiry, body.Email,
+					body.Mobile,
+				},
+			},
+		}).
+		InsertDataOption("INSERT_ROWS").
+		Context(r.Context()).
+		Fields("spreadsheetId, tableRange, updates").
+		Do()
+	if err != nil {
+		slog.ErrorContext(r.Context(), "error", "gsheets", err.Error())
+	}
+	if res.HTTPStatusCode < 200 || res.HTTPStatusCode >= 300 {
+		slog.ErrorContext(r.Context(), "error", "gsheets", fmt.Sprintf("%+v", res))
+	}
 
-	// TODO: POST to CRM
+	constactsSpreadsheetId := ""
+	sheetsService.Spreadsheets.BatchUpdate(constactsSpreadsheetId, &sheets.BatchUpdateSpreadsheetRequest{
+		Requests: []*sheets.Request{
+			{
+				AppendCells: &sheets.AppendCellsRequest{
+					Fields: "*",
+					Rows:   []*sheets.RowData{}, // TODO
+				},
+				DeleteDuplicates: &sheets.DeleteDuplicatesRequest{
+					ComparisonColumns: []*sheets.DimensionRange{}, // TODO
+					Range:             &sheets.GridRange{},        // TODO
+				},
+			},
+		},
+	})
+
+	slog.Info("appended", "gsheets", fmt.Sprintf("%v+", res))
+
 	// TODO: Send email
+
+	slog.Info("processed", "enquiry", fmt.Sprintf("%+v", body))
 }
 
 func createGoogleDriveService() *drive.Service {
@@ -177,6 +217,17 @@ func createGoogleDriveService() *drive.Service {
 	service, err := drive.NewService(ctx)
 	if err != nil {
 		slog.Error("error", "gdrive service", err.Error())
+
+		panic(err)
+	}
+
+	return service
+}
+
+func createGoogleSheetsService(ctx context.Context) *sheets.Service {
+	service, err := sheets.NewService(ctx)
+	if err != nil {
+		slog.Error("error", "gsheets service", err.Error())
 
 		panic(err)
 	}
